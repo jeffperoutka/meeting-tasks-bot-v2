@@ -1,5 +1,5 @@
 // ============================================================
-// ENGINE — Claude-powered task extraction from Fathom transcripts
+// ENGINE — Claude-powered task extraction + semantic dedup
 // ============================================================
 const Anthropic = require('@anthropic-ai/sdk');
 
@@ -71,8 +71,6 @@ If no tasks are found, return an empty tasks array with just a summary.`;
 
   const response = await stream.finalMessage();
   const content = response.content[0].text;
-
-  // Strip markdown code fences if Claude adds them
   const cleaned = content.replace(/^```(?:json)?\s*/m, '').replace(/\s*```$/m, '').trim();
 
   try {
@@ -83,4 +81,86 @@ If no tasks are found, return an empty tasks array with just a summary.`;
   }
 }
 
-module.exports = { extractTasksFromTranscript, TEAM_MEMBERS };
+// ── SEMANTIC DEDUP ──────────────────────────────────────
+// Uses Claude to match extracted tasks against existing ClickUp tasks
+async function semanticDedup(extractedTasks, existingTasks) {
+  if (!existingTasks || existingTasks.length === 0) {
+    return extractedTasks.map(t => ({ ...t, matchType: 'new', existingTaskId: null, existingTaskName: null, existingTaskUrl: null }));
+  }
+
+  // Build a concise list of existing tasks for Claude
+  const existingList = existingTasks.map((t, i) => {
+    const assignees = (t.assignees || []).map(a => a.username || a.email).join(', ');
+    const status = t.status?.status || 'unknown';
+    return `[${i}] "${t.name}" (status: ${status}, assignees: ${assignees || 'none'}, id: ${t.id})`;
+  }).join('\n');
+
+  const extractedList = extractedTasks.map((t, i) => {
+    return `[${i}] "${t.title}" — ${t.description}`;
+  }).join('\n');
+
+  const systemPrompt = `You are a task deduplication engine. Compare newly extracted meeting tasks against existing ClickUp tasks.
+
+For each extracted task, determine if it semantically matches an existing task. A match means:
+- The tasks refer to the same work item (even if worded differently)
+- Examples: "Update Sprint 1 deck" matches "Send Sprint 1 v3 to Jeff"
+- Examples: "Follow up on Phyto payment" matches "Get ETA on Phyto-Extractum payment"
+- Be generous with matching — if they're about the same deliverable/action, it's a match
+
+Respond with ONLY valid JSON, no markdown fences:
+[
+  {
+    "extractedIndex": 0,
+    "matchedExistingIndex": null,
+    "confidence": "none"
+  },
+  {
+    "extractedIndex": 1,
+    "matchedExistingIndex": 3,
+    "confidence": "high"
+  }
+]
+
+confidence levels: "high" (clearly same task), "medium" (likely same), "none" (no match)
+Set matchedExistingIndex to null if no match found.
+Only match with confidence "high" or "medium" — don't force matches.`;
+
+  try {
+    const stream = await anthropic.messages.stream({
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 4000,
+      system: systemPrompt,
+      messages: [{
+        role: 'user',
+        content: `EXISTING CLICKUP TASKS:\n${existingList}\n\nNEWLY EXTRACTED TASKS:\n${extractedList}`
+      }]
+    });
+
+    const response = await stream.finalMessage();
+    const content = response.content[0].text;
+    const cleaned = content.replace(/^```(?:json)?\s*/m, '').replace(/\s*```$/m, '').trim();
+    const matches = JSON.parse(cleaned);
+
+    // Merge match info into extracted tasks
+    return extractedTasks.map((task, i) => {
+      const match = matches.find(m => m.extractedIndex === i);
+      if (match && match.matchedExistingIndex !== null && match.confidence !== 'none') {
+        const existing = existingTasks[match.matchedExistingIndex];
+        return {
+          ...task,
+          matchType: 'update',
+          matchConfidence: match.confidence,
+          existingTaskId: existing.id,
+          existingTaskName: existing.name,
+          existingTaskUrl: existing.url,
+        };
+      }
+      return { ...task, matchType: 'new', existingTaskId: null, existingTaskName: null, existingTaskUrl: null };
+    });
+  } catch (err) {
+    console.error('Semantic dedup failed, treating all as new:', err.message);
+    return extractedTasks.map(t => ({ ...t, matchType: 'new', existingTaskId: null, existingTaskName: null, existingTaskUrl: null }));
+  }
+}
+
+module.exports = { extractTasksFromTranscript, semanticDedup, TEAM_MEMBERS };

@@ -1,5 +1,5 @@
 // ============================================================
-// CLICKUP — Task creation and dedup checking
+// CLICKUP — Task creation, updates, and smart dedup handling
 // ============================================================
 
 const QUICK_TODOS_LIST_ID = '901815203192';
@@ -20,16 +20,21 @@ async function clickupFetch(path, options = {}) {
   return resp.json();
 }
 
-async function getRecentTasks() {
+// Get all open tasks from the Quick To-do's list (for dedup matching)
+async function getExistingTasks() {
   try {
-    const data = await clickupFetch(`/list/${QUICK_TODOS_LIST_ID}/task?page=0&order_by=created&reverse=true`);
+    // Fetch open tasks (statuses: to do, in progress, etc. — not closed/done)
+    const data = await clickupFetch(
+      `/list/${QUICK_TODOS_LIST_ID}/task?page=0&order_by=created&reverse=true&subtasks=true&include_closed=false`
+    );
     return data.tasks || [];
   } catch (err) {
-    console.error('ClickUp getRecentTasks error:', err.message);
+    console.error('ClickUp getExistingTasks error:', err.message);
     return [];
   }
 }
 
+// Create a new task
 async function createTask(task) {
   const dueTimestamp = task.dueDate ? new Date(task.dueDate + 'T17:00:00Z').getTime() : null;
 
@@ -49,29 +54,82 @@ async function createTask(task) {
   });
 }
 
-async function createAllTasks(tasks) {
+// Update an existing task: add meeting context as comment + optionally update due date
+async function updateExistingTask(task) {
+  const taskId = task.existingTaskId;
+
+  // 1. Post a comment with the meeting context
+  const commentBody = {
+    comment_text: `📋 *Meeting Update*\n\nThis task was re-mentioned in a meeting:\n\n> ${task.description}\n\n_Assignee from meeting:_ ${task.assignee} | _Priority:_ ${task.priority} | _Due date mentioned:_ ${task.dueDate}`,
+    notify_all: false,
+  };
+
+  const commentResult = await clickupFetch(`/task/${taskId}/comment`, {
+    method: 'POST',
+    body: JSON.stringify(commentBody),
+  });
+
+  // 2. Update due date if the meeting mentioned a newer one
+  if (task.dueDate) {
+    const dueTimestamp = new Date(task.dueDate + 'T17:00:00Z').getTime();
+    await clickupFetch(`/task/${taskId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ due_date: dueTimestamp }),
+    });
+  }
+
+  return {
+    id: taskId,
+    url: task.existingTaskUrl,
+    commentId: commentResult?.id,
+  };
+}
+
+// Process all tasks: create new ones, update existing matches
+async function processAllTasks(tasks) {
   const results = [];
+
   for (const task of tasks) {
     try {
-      const result = await createTask(task);
-      results.push({ success: true, task: task.title, id: result.id, url: result.url });
+      if (task.matchType === 'update' && task.existingTaskId) {
+        // Update existing task instead of creating duplicate
+        const result = await updateExistingTask(task);
+        results.push({
+          success: true,
+          action: 'updated',
+          task: task.title,
+          existingTask: task.existingTaskName,
+          id: result.id,
+          url: result.url,
+        });
+      } else {
+        // Create new task
+        const result = await createTask(task);
+        results.push({
+          success: true,
+          action: 'created',
+          task: task.title,
+          id: result.id,
+          url: result.url,
+        });
+      }
     } catch (err) {
-      results.push({ success: false, task: task.title, error: err.message });
+      results.push({
+        success: false,
+        action: task.matchType === 'update' ? 'update_failed' : 'create_failed',
+        task: task.title,
+        error: err.message,
+      });
     }
   }
+
   return results;
 }
 
-async function checkForDuplicates(tasks) {
-  const recentTasks = await getRecentTasks();
-  const recentNames = recentTasks.map(t => t.name.toLowerCase());
-
-  return tasks.map(task => ({
-    ...task,
-    possibleDuplicate: recentNames.some(name =>
-      name.includes(task.title.toLowerCase()) || task.title.toLowerCase().includes(name)
-    ),
-  }));
-}
-
-module.exports = { createTask, createAllTasks, getRecentTasks, checkForDuplicates, QUICK_TODOS_LIST_ID };
+module.exports = {
+  createTask,
+  updateExistingTask,
+  processAllTasks,
+  getExistingTasks,
+  QUICK_TODOS_LIST_ID,
+};

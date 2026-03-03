@@ -4,6 +4,8 @@
 
 const SLACK_API = 'https://slack.com/api';
 
+const { TEAM_MEMBERS } = require('./engine');
+
 async function slackFetch(method, body) {
   const token = process.env.SLACK_BOT_TOKEN;
   const resp = await fetch(`${SLACK_API}/${method}`, {
@@ -22,8 +24,7 @@ async function joinChannel(channel) {
 
 async function postMessage(channel, text, options = {}) {
   return slackFetch('chat.postMessage', {
-    channel,
-    text,
+    channel, text,
     thread_ts: options.threadTs,
     blocks: options.blocks,
     mrkdwn: true,
@@ -38,7 +39,7 @@ async function openModal(triggerId, view) {
   return slackFetch('views.open', { trigger_id: triggerId, view });
 }
 
-// Build the transcript paste modal
+// ── TRANSCRIPT PASTE MODAL ────────────────────────────────
 function buildTranscriptModal() {
   return {
     type: 'modal',
@@ -62,12 +63,97 @@ function buildTranscriptModal() {
   };
 }
 
-// Build the task list message with Approve/Reject buttons
+// ── EDIT TASK MODAL ───────────────────────────────────────
+// Pre-filled modal so user can tweak any field
+function buildEditTaskModal(task, taskIndex, messageTs) {
+  const teamOptions = TEAM_MEMBERS.map(m => ({
+    text: { type: 'plain_text', text: `${m.name} (${m.role})` },
+    value: `${m.name}|${m.clickupId}`,
+  }));
+
+  const priorityOptions = [
+    { text: { type: 'plain_text', text: '🔴 Urgent' }, value: 'urgent' },
+    { text: { type: 'plain_text', text: '🟠 High' }, value: 'high' },
+    { text: { type: 'plain_text', text: '⚪ Normal' }, value: 'normal' },
+    { text: { type: 'plain_text', text: '🔵 Low' }, value: 'low' },
+  ];
+
+  // Find current assignee option
+  const currentAssignee = teamOptions.find(o => o.value.startsWith(task.assignee + '|'));
+  const currentPriority = priorityOptions.find(o => o.value === task.priority);
+
+  return {
+    type: 'modal',
+    callback_id: 'edit_task_submit',
+    private_metadata: JSON.stringify({ taskIndex, messageTs }),
+    title: { type: 'plain_text', text: 'Edit Task' },
+    submit: { type: 'plain_text', text: 'Save Changes' },
+    close: { type: 'plain_text', text: 'Cancel' },
+    blocks: [
+      {
+        type: 'input',
+        block_id: 'edit_title',
+        label: { type: 'plain_text', text: 'Task Title' },
+        element: {
+          type: 'plain_text_input',
+          action_id: 'title_input',
+          initial_value: task.title,
+        },
+      },
+      {
+        type: 'input',
+        block_id: 'edit_description',
+        label: { type: 'plain_text', text: 'Description' },
+        element: {
+          type: 'plain_text_input',
+          action_id: 'description_input',
+          multiline: true,
+          initial_value: task.description || '',
+        },
+      },
+      {
+        type: 'input',
+        block_id: 'edit_assignee',
+        label: { type: 'plain_text', text: 'Assignee' },
+        element: {
+          type: 'static_select',
+          action_id: 'assignee_input',
+          options: teamOptions,
+          ...(currentAssignee ? { initial_option: currentAssignee } : {}),
+        },
+      },
+      {
+        type: 'input',
+        block_id: 'edit_due_date',
+        label: { type: 'plain_text', text: 'Due Date' },
+        element: {
+          type: 'datepicker',
+          action_id: 'due_date_input',
+          ...(task.dueDate ? { initial_date: task.dueDate } : {}),
+        },
+      },
+      {
+        type: 'input',
+        block_id: 'edit_priority',
+        label: { type: 'plain_text', text: 'Priority' },
+        element: {
+          type: 'static_select',
+          action_id: 'priority_input',
+          options: priorityOptions,
+          ...(currentPriority ? { initial_option: currentPriority } : {}),
+        },
+      },
+    ],
+  };
+}
+
+// ── TASK LIST MESSAGE ─────────────────────────────────────
+// Shows all tasks with Edit + Remove buttons per task, Create All at bottom
 function buildTaskListBlocks(summary, tasks, submitterId) {
   const blocks = [
     {
       type: 'header',
-      text: { type: 'plain_text', text: 'Meeting Tasks Extracted' },
+      text: { type: 'plain_text', text: '📋 Meeting Tasks Extracted' },
     },
     {
       type: 'section',
@@ -77,40 +163,82 @@ function buildTaskListBlocks(summary, tasks, submitterId) {
   ];
 
   tasks.forEach((task, i) => {
-    const uncertain = task.uncertain ? ' :warning:' : '';
-    const dupe = task.possibleDuplicate ? ' :eyes: _possible duplicate_' : '';
-    const priority = task.priority === 'urgent' ? ':red_circle:' :
-                     task.priority === 'high' ? ':orange_circle:' :
-                     task.priority === 'normal' ? ':white_circle:' : ':large_blue_circle:';
+    if (task._removed) return; // Skip removed tasks
 
+    const uncertain = task.uncertain ? ' ⚠️' : '';
+    const priority = task.priority === 'urgent' ? '🔴' :
+                     task.priority === 'high' ? '🟠' :
+                     task.priority === 'normal' ? '⚪' : '🔵';
+
+    // Show match info if this matches an existing ClickUp task
+    let matchInfo = '';
+    if (task.matchType === 'update') {
+      const conf = task.matchConfidence === 'high' ? '🎯' : '🔍';
+      matchInfo = `\n${conf} _Matches existing:_ <${task.existingTaskUrl}|${task.existingTaskName}> → will *update* instead of create`;
+    }
+
+    // Task description
     blocks.push({
       type: 'section',
+      block_id: `task_desc_${i}`,
       text: {
         type: 'mrkdwn',
-        text: `${priority} *${i + 1}. ${task.title}*${dupe}\n${task.description}\n_Assignee:_ ${task.assignee}${uncertain} | _Due:_ ${task.dueDate} | _Priority:_ ${task.priority}`,
+        text: `${priority} *${i + 1}. ${task.title}*${uncertain}\n${task.description}\n_Assignee:_ ${task.assignee} | _Due:_ ${task.dueDate} | _Priority:_ ${task.priority}${matchInfo}`,
       },
     });
+
+    // Edit + Remove buttons
+    blocks.push({
+      type: 'actions',
+      block_id: `task_actions_${i}`,
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '✏️ Edit' },
+          action_id: `edit_task_${i}`,
+          value: String(i),
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '🗑️ Remove' },
+          style: 'danger',
+          action_id: `remove_task_${i}`,
+          value: String(i),
+        },
+      ],
+    });
   });
+
+  // Count active (non-removed) tasks
+  const activeCount = tasks.filter(t => !t._removed).length;
+  const updateCount = tasks.filter(t => !t._removed && t.matchType === 'update').length;
+  const newCount = activeCount - updateCount;
+
+  let footerText = `Submitted by <@${submitterId}> | ${activeCount} task(s) remaining`;
+  if (updateCount > 0) {
+    footerText += ` (${newCount} new, ${updateCount} updating existing)`;
+  }
+  footerText += '\nEdit or remove tasks as needed, then hit *Create All*';
 
   blocks.push(
     { type: 'divider' },
     {
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: `Submitted by <@${submitterId}> | ${tasks.length} task(s) extracted` }],
+      elements: [{ type: 'mrkdwn', text: footerText }],
     },
     {
       type: 'actions',
-      block_id: 'task_actions',
+      block_id: 'final_actions',
       elements: [
         {
           type: 'button',
-          text: { type: 'plain_text', text: 'Approve & Create Tasks' },
+          text: { type: 'plain_text', text: `🚀 Create All (${activeCount})` },
           style: 'primary',
-          action_id: 'approve_tasks',
+          action_id: 'create_all_tasks',
         },
         {
           type: 'button',
-          text: { type: 'plain_text', text: 'Reject' },
+          text: { type: 'plain_text', text: 'Reject All' },
           style: 'danger',
           action_id: 'reject_tasks',
         },
@@ -121,21 +249,35 @@ function buildTaskListBlocks(summary, tasks, submitterId) {
   return blocks;
 }
 
-// Build the confirmation message after tasks are created
+// ── CONFIRMATION MESSAGE ──────────────────────────────────
 function buildConfirmationBlocks(results) {
-  const successful = results.filter(r => r.success);
+  const created = results.filter(r => r.success && r.action === 'created');
+  const updated = results.filter(r => r.success && r.action === 'updated');
   const failed = results.filter(r => !r.success);
 
-  let text = `:white_check_mark: *${successful.length} task(s) created in ClickUp!*\n\n`;
+  let text = '';
 
-  successful.forEach(r => {
-    text += `• ${r.task}`;
-    if (r.url) text += ` — <${r.url}|View>`;
+  if (created.length > 0) {
+    text += `✅ *${created.length} new task(s) created:*\n`;
+    created.forEach(r => {
+      text += `• ${r.task}`;
+      if (r.url) text += ` — <${r.url}|View>`;
+      text += '\n';
+    });
     text += '\n';
-  });
+  }
+
+  if (updated.length > 0) {
+    text += `🔄 *${updated.length} existing task(s) updated:*\n`;
+    updated.forEach(r => {
+      text += `• ${r.task} → updated <${r.url}|${r.existingTask}>`;
+      text += '\n';
+    });
+    text += '\n';
+  }
 
   if (failed.length > 0) {
-    text += `\n:x: *${failed.length} task(s) failed:*\n`;
+    text += `❌ *${failed.length} task(s) failed:*\n`;
     failed.forEach(r => { text += `• ${r.task}: ${r.error}\n`; });
   }
 
@@ -148,6 +290,7 @@ module.exports = {
   updateMessage,
   openModal,
   buildTranscriptModal,
+  buildEditTaskModal,
   buildTaskListBlocks,
   buildConfirmationBlocks,
 };
