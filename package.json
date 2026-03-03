@@ -1,0 +1,12 @@
+{
+  "name": "meeting-tasks-bot-v2",
+  "version": "1.0.0",
+  "description": "Meeting Tasks Bot — Extract tasks from Fathom transcripts, approve, push to ClickUp",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "@vercel/functions": "^1.0.0",
+    "@anthropic-ai/sdk": "^0.39.0"
+  }
+}
