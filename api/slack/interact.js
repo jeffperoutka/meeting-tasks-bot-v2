@@ -2,7 +2,7 @@
 // INTERACTION HANDLER — Modal submissions + button clicks
 // ============================================================
 const { waitUntil } = require('@vercel/functions');
-const { postMessage, updateMessage, buildTaskListBlocks, buildConfirmationBlocks } = require('../lib/slack');
+const { joinChannel, postMessage, updateMessage, buildTaskListBlocks, buildConfirmationBlocks } = require('../lib/slack');
 const { extractTasksFromTranscript } = require('../lib/engine');
 const { createAllTasks, checkForDuplicates } = require('../lib/clickup');
 
@@ -61,6 +61,12 @@ async function handleTranscriptSubmission(payload) {
   if (!transcript.trim()) {
     await postMessage(channel, ':x: Empty transcript submitted. Please try again.');
     return;
+  }
+
+  // Ensure bot is in the channel (no-op if already joined)
+  const joinResult = await joinChannel(channel);
+  if (!joinResult.ok && joinResult.error !== 'already_in_channel') {
+    console.warn('Could not join channel:', joinResult.error);
   }
 
   // Post a processing message

@@ -16,6 +16,10 @@ async function slackFetch(method, body) {
   return data;
 }
 
+async function joinChannel(channel) {
+  return slackFetch('conversations.join', { channel });
+}
+
 async function postMessage(channel, text, options = {}) {
   return slackFetch('chat.postMessage', {
     channel,
@@ -139,6 +143,7 @@ function buildConfirmationBlocks(results) {
 }
 
 module.exports = {
+  joinChannel,
   postMessage,
   updateMessage,
   openModal,
