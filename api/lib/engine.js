@@ -81,22 +81,33 @@ If no tasks are found, return an empty tasks array with just a summary.`;
   }
 }
 
+// ── TIMEOUT HELPER ─────────────────────────────────────
+function withTimeout(promise, ms, label = 'Operation') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)),
+  ]);
+}
+
 // ── SEMANTIC DEDUP ──────────────────────────────────────
 // Uses Claude to match extracted tasks against existing ClickUp tasks
 async function semanticDedup(extractedTasks, existingTasks) {
   if (!existingTasks || existingTasks.length === 0) {
+    console.log('No existing tasks to dedup against, marking all as new');
     return extractedTasks.map(t => ({ ...t, matchType: 'new', existingTaskId: null, existingTaskName: null, existingTaskUrl: null }));
   }
 
-  // Build a concise list of existing tasks for Claude
-  const existingList = existingTasks.map((t, i) => {
-    const assignees = (t.assignees || []).map(a => a.username || a.email).join(', ');
-    const status = t.status?.status || 'unknown';
-    return `[${i}] "${t.name}" (status: ${status}, assignees: ${assignees || 'none'}, id: ${t.id})`;
+  // Cap existing tasks to 75 most recent to keep prompt manageable
+  const cappedTasks = existingTasks.slice(0, 75);
+  console.log(`Dedup: comparing ${extractedTasks.length} extracted vs ${cappedTasks.length} existing tasks (${existingTasks.length} total)`);
+
+  // Build a concise list — name + status only (minimal tokens)
+  const existingList = cappedTasks.map((t, i) => {
+    return `[${i}] "${t.name}" (id: ${t.id})`;
   }).join('\n');
 
   const extractedList = extractedTasks.map((t, i) => {
-    return `[${i}] "${t.title}" — ${t.description}`;
+    return `[${i}] "${t.title}" — ${t.description?.substring(0, 100) || ''}`;
   }).join('\n');
 
   const systemPrompt = `You are a task deduplication engine. Compare newly extracted meeting tasks against existing ClickUp tasks.
@@ -126,26 +137,32 @@ Set matchedExistingIndex to null if no match found.
 Only match with confidence "high" or "medium" — don't force matches.`;
 
   try {
-    const stream = await anthropic.messages.stream({
-      model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 4000,
-      system: systemPrompt,
-      messages: [{
-        role: 'user',
-        content: `EXISTING CLICKUP TASKS:\n${existingList}\n\nNEWLY EXTRACTED TASKS:\n${extractedList}`
-      }]
-    });
+    // Use non-streaming create() with 60s timeout — much faster than streaming for structured output
+    const response = await withTimeout(
+      anthropic.messages.create({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 4000,
+        system: systemPrompt,
+        messages: [{
+          role: 'user',
+          content: `EXISTING CLICKUP TASKS:\n${existingList}\n\nNEWLY EXTRACTED TASKS:\n${extractedList}`
+        }]
+      }),
+      60000,
+      'Claude dedup'
+    );
 
-    const response = await stream.finalMessage();
     const content = response.content[0].text;
     const cleaned = content.replace(/^```(?:json)?\s*/m, '').replace(/\s*```$/m, '').trim();
     const matches = JSON.parse(cleaned);
+
+    console.log(`Dedup complete: ${matches.filter(m => m.matchedExistingIndex !== null).length} matches found`);
 
     // Merge match info into extracted tasks
     return extractedTasks.map((task, i) => {
       const match = matches.find(m => m.extractedIndex === i);
       if (match && match.matchedExistingIndex !== null && match.confidence !== 'none') {
-        const existing = existingTasks[match.matchedExistingIndex];
+        const existing = cappedTasks[match.matchedExistingIndex];
         return {
           ...task,
           matchType: 'update',

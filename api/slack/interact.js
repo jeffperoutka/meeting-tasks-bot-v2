@@ -138,8 +138,15 @@ async function handleTranscriptSubmission(payload) {
       { type: 'section', text: { type: 'mrkdwn', text: `⏳ *Step 2/2:* Found ${tasks.length} tasks. Cross-referencing with existing ClickUp tasks...` } },
     ]);
 
-    const existingTasks = await getExistingTasks();
-    const tasksWithDedup = await semanticDedup(tasks, existingTasks);
+    let tasksWithDedup;
+    try {
+      const existingTasks = await getExistingTasks();
+      console.log(`Fetched ${existingTasks.length} existing ClickUp tasks`);
+      tasksWithDedup = await semanticDedup(tasks, existingTasks);
+    } catch (dedupErr) {
+      console.error('Dedup step failed, continuing without dedup:', dedupErr.message);
+      tasksWithDedup = tasks.map(t => ({ ...t, matchType: 'new', existingTaskId: null, existingTaskName: null, existingTaskUrl: null }));
+    }
 
     // Build the interactive task list
     const blocks = buildTaskListBlocks(summary, tasksWithDedup, userId);

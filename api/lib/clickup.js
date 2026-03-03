@@ -9,15 +9,23 @@ const PRIORITY_MAP = { urgent: 1, high: 2, normal: 3, low: 4 };
 
 async function clickupFetch(path, options = {}) {
   const token = process.env.CLICKUP_API_TOKEN;
-  const resp = await fetch(`${CLICKUP_API}${path}`, {
-    ...options,
-    headers: {
-      'Authorization': token,
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
-  });
-  return resp.json();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
+  try {
+    const resp = await fetch(`${CLICKUP_API}${path}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Authorization': token,
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+    });
+    return resp.json();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // Get all open tasks from the Quick To-do's list (for dedup matching)
