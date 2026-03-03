@@ -65,6 +65,19 @@ async function handleTranscriptSubmission(payload) {
 
   // Post a processing message
   const processingMsg = await postMessage(channel, ':hourglass_flowing_sand: Extracting tasks from transcript...');
+
+  // If postMessage failed (e.g. bot not in channel), log and bail
+  if (!processingMsg.ok) {
+    console.error('Failed to post processing message:', processingMsg.error);
+    // Try posting to the user directly as a fallback
+    try {
+      await postMessage(userId, `:x: Meeting Task Bot couldn't post to <#${channel}>. Please invite the bot to the channel first with \`/invite @Meeting Task Bot\``);
+    } catch (dmErr) {
+      console.error('Fallback DM also failed:', dmErr.message);
+    }
+    return;
+  }
+
   const processingTs = processingMsg.ts;
 
   try {
@@ -100,9 +113,13 @@ async function handleTranscriptSubmission(payload) {
 
   } catch (err) {
     console.error('Transcript processing error:', err);
-    await updateMessage(channel, processingTs, `:x: Error extracting tasks: ${err.message}`, [
-      { type: 'section', text: { type: 'mrkdwn', text: `:x: *Error extracting tasks:* ${err.message}\n\nPlease try again with /transcribe.` } },
-    ]);
+    if (processingTs) {
+      await updateMessage(channel, processingTs, `:x: Error extracting tasks: ${err.message}`, [
+        { type: 'section', text: { type: 'mrkdwn', text: `:x: *Error extracting tasks:* ${err.message}\n\nPlease try again with /transcribe.` } },
+      ]);
+    } else {
+      await postMessage(channel, `:x: *Error extracting tasks:* ${err.message}\n\nPlease try again with /transcribe.`);
+    }
   }
 }
 
