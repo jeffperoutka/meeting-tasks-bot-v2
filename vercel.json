@@ -3,11 +3,5 @@
     "api/**": {
       "maxDuration": 300
     }
-  },
-  "crons": [
-    {
-      "path": "/api/cron/nudge",
-      "schedule": "0 * * * *"
-    }
-  ]
+  }
 }
