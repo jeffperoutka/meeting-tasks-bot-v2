@@ -23,8 +23,17 @@ function getEndOfWeekDate() {
 }
 
 async function extractTasksFromTranscript(transcript) {
+  const { getRulesForPrompt } = require('./rules');
   const endOfWeek = getEndOfWeekDate();
   const teamList = TEAM_MEMBERS.map(m => `- ${m.name} (${m.role})`).join('\n');
+
+  // Load any learned rules from team feedback
+  let trainingRules = '';
+  try {
+    trainingRules = await getRulesForPrompt();
+  } catch (e) {
+    console.warn('[ENGINE] Could not load training rules:', e.message);
+  }
 
   const systemPrompt = `You are Meeting Tasks Bot for AEO Labs, an AI SEO agency.
 
@@ -42,7 +51,7 @@ RULES:
 6. Create a brief 2-3 sentence meeting summary.
 7. If the transcript mentions Fathom action items, prioritize those.
 8. Parse speaker labels (e.g., "Jeff:", "Hannah:") to understand who committed to what.
-
+${trainingRules}
 OUTPUT FORMAT — respond with ONLY valid JSON, no markdown fences:
 {
   "summary": "Brief 2-3 sentence meeting summary",

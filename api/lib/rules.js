@@ -1,89 +1,166 @@
 // ============================================================
-// RULES ENGINE — Training rules with KV + env var + default fallback
+// RULES ENGINE — Training rules with GitHub persistence
 // ============================================================
+// On cold start: read rules.json from repo via GitHub API.
+// On add/remove: update in-memory + commit to GitHub (auto-deploys).
+// No KV or external storage needed — just GITHUB_PAT env var.
 
+const REPO = 'jeffperoutka/meeting-tasks-bot-v2';
+const FILE_PATH = 'rules.json';
+
+// In-memory cache
 let rulesCache = null;
 let lastFetched = 0;
-const CACHE_TTL = 60000;
+const CACHE_TTL = 60000; // Re-read from GitHub every 60s max
 
-const DEFAULT_RULES = [
-  // Add built-in rules here:
-  // { rule: 'Description of rule', category: 'process', addedBy: 'system', addedAt: '2024-01-01', sourceMessage: 'Built-in' }
-];
-
+// ── LOAD RULES ─────────────────────────────────────────
 async function loadRules() {
   if (rulesCache && Date.now() - lastFetched < CACHE_TTL) return rulesCache;
 
-  // Try Vercel KV first
-  try {
-    if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
-      const resp = await fetch(process.env.KV_REST_API_URL + '/get/meeting-tasks-bot-v2_rules', {
-        headers: { Authorization: 'Bearer ' + process.env.KV_REST_API_TOKEN }
-      });
-      const data = await resp.json();
-      if (data.result) {
-        rulesCache = JSON.parse(data.result);
-        lastFetched = Date.now();
-        return rulesCache;
-      }
-    }
-  } catch (err) { console.error('KV load error:', err.message); }
-
-  // Try env var fallback
-  if (process.env.MEETING_TASKS_BOT_V2_RULES) {
-    try {
-      rulesCache = JSON.parse(process.env.MEETING_TASKS_BOT_V2_RULES);
-      lastFetched = Date.now();
-      return rulesCache;
-    } catch (err) { console.error('Rules env parse error:', err.message); }
+  const pat = process.env.GITHUB_PAT;
+  if (!pat) {
+    console.warn('[RULES] No GITHUB_PAT — using empty rules');
+    rulesCache = [];
+    lastFetched = Date.now();
+    return rulesCache;
   }
 
-  rulesCache = [...DEFAULT_RULES];
-  lastFetched = Date.now();
+  try {
+    const resp = await fetch(`https://api.github.com/repos/${REPO}/contents/${FILE_PATH}`, {
+      headers: {
+        'Authorization': `Bearer ${pat}`,
+        'Accept': 'application/vnd.github.v3+json',
+      },
+    });
+
+    if (resp.ok) {
+      const data = await resp.json();
+      const content = Buffer.from(data.content, 'base64').toString('utf8');
+      rulesCache = JSON.parse(content);
+      lastFetched = Date.now();
+      console.log(`[RULES] Loaded ${rulesCache.length} rules from GitHub`);
+    } else {
+      console.log('[RULES] No rules.json in repo yet, starting empty');
+      rulesCache = [];
+      lastFetched = Date.now();
+    }
+  } catch (err) {
+    console.error('[RULES] GitHub load error:', err.message);
+    rulesCache = rulesCache || [];
+    lastFetched = Date.now();
+  }
+
   return rulesCache;
 }
 
+// ── SAVE RULES TO GITHUB ───────────────────────────────
 async function saveRules(rules) {
   rulesCache = rules;
   lastFetched = Date.now();
+
+  const pat = process.env.GITHUB_PAT;
+  if (!pat) {
+    console.warn('[RULES] No GITHUB_PAT — rules only in memory');
+    return;
+  }
+
   try {
-    if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
-      await fetch(process.env.KV_REST_API_URL + '/set/meeting-tasks-bot-v2_rules', {
-        method: 'POST',
-        headers: { Authorization: 'Bearer ' + process.env.KV_REST_API_TOKEN, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ value: JSON.stringify(rules) })
-      });
-      return;
+    // Get current file SHA (needed for updates)
+    let sha;
+    const getResp = await fetch(`https://api.github.com/repos/${REPO}/contents/${FILE_PATH}`, {
+      headers: {
+        'Authorization': `Bearer ${pat}`,
+        'Accept': 'application/vnd.github.v3+json',
+      },
+    });
+
+    if (getResp.ok) {
+      const existing = await getResp.json();
+      sha = existing.sha;
     }
-  } catch (err) { console.error('KV save error:', err.message); }
-  console.log('Rules (no KV):', JSON.stringify(rules));
+
+    // Commit updated rules
+    const content = Buffer.from(JSON.stringify(rules, null, 2)).toString('base64');
+    const putResp = await fetch(`https://api.github.com/repos/${REPO}/contents/${FILE_PATH}`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${pat}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        message: `rules: ${rules.length} training rules (auto-commit)`,
+        content,
+        ...(sha ? { sha } : {}),
+      }),
+    });
+
+    if (putResp.ok) {
+      console.log(`[RULES] Committed ${rules.length} rules to GitHub`);
+    } else {
+      const err = await putResp.text();
+      console.error('[RULES] GitHub commit failed:', putResp.status, err.substring(0, 200));
+    }
+  } catch (err) {
+    console.error('[RULES] GitHub save error:', err.message);
+  }
 }
 
-async function getTrainingRules() { return loadRules(); }
+// ── PUBLIC API ─────────────────────────────────────────
+
+async function getTrainingRules() {
+  return loadRules();
+}
 
 async function addTrainingRule(rule) {
   const rules = await loadRules();
   rules.push(rule);
   await saveRules(rules);
+  console.log(`[RULES] Added: "${rule.rule}" (${rules.length} total)`);
   return rules;
 }
 
 async function removeTrainingRule(index) {
   const rules = await loadRules();
-  if (index >= 0 && index < rules.length) rules.splice(index, 1);
+  if (index < 0 || index >= rules.length) return rules;
+  const removed = rules.splice(index, 1)[0];
   await saveRules(rules);
+  console.log(`[RULES] Removed: "${removed.rule}" (${rules.length} remaining)`);
   return rules;
 }
 
 async function listRulesFormatted() {
   const rules = await loadRules();
-  if (rules.length === 0) return 'No rules configured yet.';
-  let formatted = '\u{1F4DA} *Rules*\n\n';
+  if (rules.length === 0) {
+    return '📋 *No training rules yet.*\nReply to my messages with feedback to teach me!';
+  }
+
+  let text = `📋 *Training Rules (${rules.length}):*\n\n`;
   rules.forEach((r, i) => {
-    const source = r.addedBy === 'system' ? '(built-in)' : '(<@' + r.addedBy + '>)';
-    formatted += (i + 1) + '. ' + r.rule + ' ' + source + '\n';
+    const source = r.source === 'thread_feedback' ? '💬' : '📝';
+    text += `${i + 1}. ${source} ${r.rule}\n`;
+    text += `   _${r.category} | by <@${r.addedBy}>_\n`;
   });
-  return formatted;
+  text += '\n_Use "meeting-tasks-bot-v2 remove rule N" to delete a rule._';
+  return text;
 }
 
-module.exports = { getTrainingRules, addTrainingRule, removeTrainingRule, listRulesFormatted, DEFAULT_RULES };
+// Returns rules formatted for injection into Claude prompts
+async function getRulesForPrompt() {
+  const rules = await loadRules();
+  if (rules.length === 0) return '';
+
+  let text = '\n\nTRAINING RULES (learned from team feedback — follow these strictly):\n';
+  rules.forEach((r, i) => {
+    text += `${i + 1}. ${r.rule}\n`;
+  });
+  return text;
+}
+
+module.exports = {
+  getTrainingRules,
+  addTrainingRule,
+  removeTrainingRule,
+  listRulesFormatted,
+  getRulesForPrompt,
+};
